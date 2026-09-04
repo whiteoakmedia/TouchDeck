@@ -39,6 +39,25 @@ Gesture thresholds are tuned for real fingers on real panels — see
 
 ---
 
+## Download (easiest)
+
+**[⬇ Download TouchDeck.dmg](https://github.com/whiteoakmedia/TouchDeck/releases/latest/download/TouchDeck.dmg)** —
+no Xcode required.
+
+1. Open the DMG and drag **both** apps onto the Applications folder.
+2. macOS will block them on first launch because they aren't notarized by Apple
+   (this is a free open-source project). To allow each app: double-click it,
+   then go to **System Settings › Privacy & Security** and click **"Open Anyway"**.
+   You do this once per app.
+3. Follow the **[first-run setup](#first-run-setup-the-two-things-only-you-can-do)**
+   below: grant Accessibility, then map your touchscreen to its display.
+
+> Prefer to build it yourself, or want to avoid the Gatekeeper step? See
+> [Install from source](#install-from-source) — that build is trusted
+> automatically because it's compiled on your own Mac.
+
+---
+
 ## Requirements
 
 - macOS 13 (Ventura) or later
@@ -55,7 +74,7 @@ Gesture thresholds are tuned for real fingers on real panels — see
 
 ---
 
-## Install
+## Install from source
 
 ```bash
 git clone https://github.com/whiteoakmedia/TouchDeck.git
