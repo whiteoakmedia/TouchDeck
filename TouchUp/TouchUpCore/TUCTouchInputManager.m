@@ -1,0 +1,951 @@
+//
+//  TUCTouchInputManager.m
+//  Touch Up Core
+//
+//  Created by Sebastian Hueber on 03.02.23.
+//
+
+#import "TUCTouchInputManager.h"
+
+#import "HIDInterpreter.h"
+#import "TUCCursorUtilities.h"
+
+@interface TUCTouchInputManager ()
+
+@property NSMutableDictionary<NSNumber *, NSNumber *> *frameIDsByLocationID;
+
+@property (weak, nullable) TUCTouch *cursorTouch;
+@property (weak, nullable) TUCTouch *gestureAdditionalTouch;
+
+@property BOOL cursorTouchQualifiedForTap; // if the cursor entered moving state once it can no longer be interpreted as tap
+@property CGPoint cursorTouchStartLocation; // where the cursor touch first landed, for tap slop
+@property (strong, nullable) NSDate *cursorTouchStartDate; // when it landed, for hold detection
+@property BOOL cursorTouchDidHold; //
+@property (strong) NSDate *cursorTouchStationarySinceDate;
+
+@property CGFloat pinchDistance;
+
+@property TUCCursorGesture identifiedMultitouchGesture;
+
+@property NSUInteger episodeMaxTouchCount; // most fingers seen at once in this contact episode
+@property CGFloat fourFingerStartSpreadMM; // finger spread when the 4th finger landed
+@property BOOL threeFingerGestureActive;   // three fingers are (or were) down in this contact episode
+@property BOOL threeFingerGestureFired;    // a three-finger gesture was already emitted this episode
+@property CGPoint threeFingerStartCentroid;
+@property CGFloat threeFingerMaxTravelMM;
+@property (strong, nullable) NSDate *threeFingerStartDate;
+
+@end
+
+
+/// How far (in mm) a finger may travel from where it landed and still count as a tap.
+static const CGFloat TUCTapSlopInMM = 5.0;
+
+/// How far (in mm) the centroid of three fingers must travel to count as a swipe.
+static const CGFloat TUCThreeFingerSwipeThresholdMM = 15.0;
+/// Max centroid travel (mm) and duration (s) for three fingers to count as a tap.
+static const CGFloat TUCThreeFingerTapSlopInMM = 8.0;
+static const NSTimeInterval TUCThreeFingerTapMaxDuration = 0.4;
+
+/// How far (in mm) a finger may drift while resting and still arm hold-and-drag.
+static const CGFloat TUCHoldSlopInMM = 4.0;
+
+/// Four-finger pinch-in: fingers must start at least this spread out (mm) ...
+static const CGFloat TUCFourFingerPinchMinStartSpreadMM = 50.0;
+/// ... and collapse below this fraction of their starting spread.
+static const CGFloat TUCFourFingerPinchRatio = 0.55;
+
+
+@implementation TUCTouchInputManager
+
+#pragma mark   Start & Stop
+
+- (void)start {
+    
+    __weak id weakSelf = self;
+    
+    // needs to run on main anyway
+//    [NSThread detachNewThreadWithBlock:^{
+//        [NSThread setThreadPriority:1];
+    OpenHIDManager((__bridge void *)(weakSelf));
+//    }];
+    
+}
+
+- (void)stop {
+    CloseHIDManager();
+}
+
+- (void)setTouchscreensSeized:(BOOL)seized {
+    SetTouchDevicesSeized(seized);
+}
+
+
+- (void)didConnectTouchscreenWithLocationID:(uint32_t)locationID {
+    self.frameIDsByLocationID[@(locationID)] = @0;
+    [self.delegate touchscreenDidConnectWithLocationID:locationID];
+}
+
+- (void)didDisconnectTouchscreenWithLocationID:(uint32_t)locationID {
+    [self.frameIDsByLocationID removeObjectForKey:@(locationID)];
+    [self.delegate touchscreenDidDisconnectWithLocationID:locationID];
+}
+
+
+
+#pragma mark - Reacting to HID Events
+
+- (NSInteger)currentFrameIDForLocationID:(uint32_t)locationID {
+    return self.frameIDsByLocationID[@(locationID)].integerValue;
+}
+
+- (void)didProcessReportForLocationID:(uint32_t)locationID {
+    // go through all touches: if the frame is not the latest one, the touch might be old and should be removed.
+    NSInteger currentFrameID = [self currentFrameIDForLocationID:locationID];
+
+    for (TUCTouch *touch in self.touchSet) {
+        if (touch.locationID != locationID) continue;
+
+        if (touch.lastUpdated + self.errorResistance < currentFrameID) {
+            [touch setPhase:NSTouchPhaseCancelled];
+            [self removeTouch:touch now:NO];
+        }
+    }
+
+    if ([[self activeTouches] count] == 0) {
+        [self stopCurrentGesture];
+    }
+
+    self.frameIDsByLocationID[@(locationID)] = @(currentFrameID + 1);
+
+    [self processTouchesForCursorInput];
+
+}
+
+
+- (void)stopCurrentGesture {
+    [[TUCCursorUtilities sharedInstance] stopDraggingCursor];
+    [[TUCCursorUtilities sharedInstance] stopMagnifying];
+
+    self.identifiedMultitouchGesture = _TUCCursorGestureNone;
+}
+
+
+
+/**
+ Most important event handling callback: it posts the events to the system where the touches need to go
+ */
+- (void)updateTouch:(NSInteger)contactID locationID:(uint32_t)locationID withLocation:(CGPoint)digitizerPoint onSurface:(BOOL)isOnSurface tooLargeForFinger:(BOOL)confidenceFlag {
+    
+    // assume that this is an erroneous message!!!
+    if (self.ignoreOriginTouches && CGPointEqualToPoint(digitizerPoint, CGPointZero)) {
+        return;
+    }
+    
+    CGPoint point = [self convertDigitizerPointToRelativeScreenPoint:digitizerPoint locationID:locationID];
+    
+    BOOL isNewTouch = NO;
+    TUCTouch *touch = [self obtainTouchWithID:contactID locationID:locationID isNew:&isNewTouch];
+    
+    if (isNewTouch && (self.cursorTouch == nil || !self.cursorTouch.isActive)) {
+        self.cursorTouch = touch;
+        self.cursorTouchQualifiedForTap = YES;
+        self.cursorTouchDidHold = NO;
+        self.cursorTouchStationarySinceDate = nil;
+        self.cursorTouchStartLocation = point;
+        self.cursorTouchStartDate = [NSDate date];
+    }
+    
+    [touch setLocation: point];
+    [touch setIsOnSurface:isOnSurface];
+    [touch setConfidenceFlag:confidenceFlag];
+    [touch setLastUpdated:[self currentFrameIDForLocationID:locationID]];
+    
+    if (!isOnSurface) {
+        [touch setPhase: NSTouchPhaseEnded];
+        [self removeTouch:touch now:NO];
+        [self.delegate touchesDidChange];
+        return;
+        
+    }
+    
+    if(touch.previousPhase != NSTouchPhaseEnded && !isNewTouch) {
+        // update to an existing touch... check if stationary or not
+        CGFloat digitizerRelDistance = sqrt(pow(touch.location.x - touch.previousLocation.x, 2) + pow(touch.location.y - touch.previousLocation.y, 2));
+        CGFloat screenSize = [self touchscreenForLocationID:locationID].nativePhysicalSize.width;
+        //TODO: - Make customizable in settings?
+        BOOL isStationary = (digitizerRelDistance * screenSize) < 0.1;
+//        BOOL isStationary = CGPointEqualToPoint(touch.location, touch.previousLocation);
+        
+        if (touch.uuid == self.cursorTouch.uuid) {
+            if (!isStationary) {
+                // A single noisy frame must not kill the tap: capacitive panels jitter well
+                // beyond the stationary threshold. Only give up on the tap once the finger has
+                // travelled further than TUCTapSlopInMM from where it first landed.
+                CGFloat slopRelDistance = sqrt(pow(touch.location.x - self.cursorTouchStartLocation.x, 2)
+                                               + pow(touch.location.y - self.cursorTouchStartLocation.y, 2));
+                if ((slopRelDistance * screenSize) > TUCTapSlopInMM) {
+                    self.cursorTouchQualifiedForTap = NO;
+                }
+                self.cursorTouchStationarySinceDate = nil;
+                
+            } else if (touch.phase !=  NSTouchPhaseStationary) {
+                self.cursorTouchStationarySinceDate = [NSDate date];
+            }
+        }
+        
+        [touch setPhase:isStationary ? NSTouchPhaseStationary : NSTouchPhaseMoved];
+    }
+    
+    
+    [self.delegate touchesDidChange];
+    
+    return;
+}
+
+
+- (void)updateTouch:(NSInteger)contactID locationID:(uint32_t)locationID withSize:(CGSize)size azimuth:(CGFloat)azimuth {
+    BOOL isNewTouch = NO;
+    TUCTouch *touch = [self obtainTouchWithID:contactID locationID:locationID isNew:&isNewTouch];
+    [touch setLastUpdated:[self currentFrameIDForLocationID:locationID]];
+    
+    [touch setSize:size];
+    [touch setAzimuth:azimuth];
+}
+
+
+
+#pragma mark - Mouse Cursor Management
+
+
+
+- (void)processTouchesForCursorInput {
+    
+    if(!self.cursorTouch || !self.postMouseEvents) {
+        return;
+    }
+    
+    TUCTouch *cursorTouch = self.cursorTouch;
+    
+    
+    NSArray<TUCTouch *> *touches = [[self activeTouches] allObjects];
+    NSTouchPhase phase = cursorTouch.phase;
+    
+    
+    // MARK: Three finger gestures
+    // Handled before everything else: while three fingers are (or were) on the surface,
+    // single- and two-finger interpretation is suspended for the rest of the episode.
+    NSUInteger activeCount = touches.count;
+    
+    if (activeCount >= 3) {
+        CGFloat physicalWidth = [self touchscreenForLocationID:cursorTouch.locationID].nativePhysicalSize.width;
+        CGPoint centroid = [self centroidOfTouches:touches];
+        
+        CGFloat spreadMM = [self spreadOfTouches:touches around:centroid] * physicalWidth;
+        if (activeCount >= 4 && self.episodeMaxTouchCount < 4) {
+            self.fourFingerStartSpreadMM = spreadMM;
+        }
+        if (activeCount > self.episodeMaxTouchCount) self.episodeMaxTouchCount = activeCount;
+        
+        if (!self.threeFingerGestureActive) {
+            self.threeFingerGestureActive = YES;
+            self.threeFingerGestureFired = NO;
+            self.threeFingerStartCentroid = centroid;
+            self.threeFingerMaxTravelMM = 0;
+            self.threeFingerStartDate = [NSDate date];
+            
+            // abort whatever the first two fingers were doing
+            [self stopCurrentGesture];
+            self.cursorTouchQualifiedForTap = NO;
+            self.cursorTouchDidHold = NO;
+            
+        } else if (!self.threeFingerGestureFired && physicalWidth > 0) {
+            CGFloat dx = centroid.x - self.threeFingerStartCentroid.x;
+            CGFloat dy = centroid.y - self.threeFingerStartCentroid.y;
+            CGFloat travelMM = sqrt(dx*dx + dy*dy) * physicalWidth;
+            self.threeFingerMaxTravelMM = MAX(self.threeFingerMaxTravelMM, travelMM);
+            
+            if (self.episodeMaxTouchCount >= 4) {
+                // four-finger episode: only the pinch-in can fire, never 3-finger actions
+                if (activeCount >= 4
+                    && self.fourFingerStartSpreadMM >= TUCFourFingerPinchMinStartSpreadMM
+                    && spreadMM <= self.fourFingerStartSpreadMM * TUCFourFingerPinchRatio) {
+                    self.threeFingerGestureFired = YES;
+                    [self performMouseEventForGesture:TUCCursorGestureFourFingerPinchIn];
+                }
+            }
+            else if (travelMM > TUCThreeFingerSwipeThresholdMM) {
+                TUCCursorGesture gesture;
+                if (fabs(dx) > fabs(dy)) {
+                    gesture = dx > 0 ? TUCCursorGestureThreeFingerSwipeRight : TUCCursorGestureThreeFingerSwipeLeft;
+                } else {
+                    gesture = dy > 0 ? TUCCursorGestureThreeFingerSwipeDown : TUCCursorGestureThreeFingerSwipeUp;
+                }
+                self.threeFingerGestureFired = YES;
+                [self performMouseEventForGesture:gesture];
+            }
+        }
+        return;
+    }
+    
+    if (self.threeFingerGestureActive) {
+        // fingers are lifting: maybe it was a quick tap
+        if (!self.threeFingerGestureFired) {
+            NSTimeInterval duration = -[self.threeFingerStartDate timeIntervalSinceNow];
+            if (self.episodeMaxTouchCount < 4
+                && duration < TUCThreeFingerTapMaxDuration && self.threeFingerMaxTravelMM < TUCThreeFingerTapSlopInMM) {
+                [self performMouseEventForGesture:TUCCursorGestureThreeFingerTap];
+            }
+            self.threeFingerGestureFired = YES;
+        }
+        if (activeCount == 0) {
+            self.threeFingerGestureActive = NO;
+            self.threeFingerGestureFired = NO;
+            self.threeFingerStartDate = nil;
+            self.episodeMaxTouchCount = 0;
+        }
+        return; // swallow residual touches until every finger has lifted
+    }
+    
+    
+    // Hold detection: the finger has rested near its landing point for the hold duration.
+    // Deliberately not based on the per-frame stationary flag - sensor jitter exceeds it.
+    if (!self.cursorTouchDidHold && self.cursorTouchStartDate != nil && activeCount == 1) {
+        NSTimeInterval elapsed = -[self.cursorTouchStartDate timeIntervalSinceNow];
+        if (elapsed > self.holdDuration) {
+            CGFloat physicalWidth = [self touchscreenForLocationID:cursorTouch.locationID].nativePhysicalSize.width;
+            CGFloat travelMM = sqrt(pow(cursorTouch.location.x - self.cursorTouchStartLocation.x, 2)
+                                    + pow(cursorTouch.location.y - self.cursorTouchStartLocation.y, 2)) * physicalWidth;
+            if (travelMM < TUCHoldSlopInMM) {
+                self.cursorTouchDidHold = YES;
+            }
+        }
+    }
+    
+    if (phase == NSTouchPhaseBegan) {
+        [self performMouseEventForGesture:TUCCursorGestureTouchDown];
+        return;
+    }
+    
+    
+    else if (phase == NSTouchPhaseStationary) {
+        NSTimeInterval holdDuration = 0;
+        if (self.cursorTouchStationarySinceDate != nil) {
+            holdDuration = [[NSDate date] timeIntervalSinceDate:self.cursorTouchStationarySinceDate];
+        }
+        if (self.cursorTouchQualifiedForTap && holdDuration > self.holdDuration) {
+            // the user left the finger on the screen for the min duration required to produce a hold
+            self.cursorTouchDidHold = YES;
+        }
+        
+        [self checkForSecondaryClick];
+        
+        return;
+    }
+    
+    
+    else if (phase == NSTouchPhaseEnded) {
+        if (self.identifiedMultitouchGesture == _TUCCursorGestureNone ) {
+            if (self.cursorTouchDidHold) {
+                [self performMouseEventForGesture:TUCCursorGestureHoldAndDrag];
+            } else if (!self.cursorTouchQualifiedForTap) {
+                [self performMouseEventForGesture:TUCCursorGestureDrag];
+            }
+        }
+        
+        [self stopCurrentGesture];
+        
+        if (self.cursorTouchQualifiedForTap) {
+            [self performMouseEventForGesture:TUCCursorGestureTap];
+        } else {
+            if (self.identifiedMultitouchGesture != _TUCCursorGestureNone) {
+                [self performMouseEventForGesture:self.identifiedMultitouchGesture];
+            }
+        }
+        
+        return;
+    }
+    
+    
+    else if (phase == NSTouchPhaseCancelled) {
+        [self stopCurrentGesture];
+        return;
+    }
+    
+    if ([self checkForSecondaryClick]) {
+        return;
+    }
+    
+    if ([touches count] == 2 && [touches containsObject: cursorTouch]) {
+        // check if we need to initiate two finger drag, pinch, ...
+        if (self.identifiedMultitouchGesture == _TUCCursorGestureNone ) {
+            
+            TUCTouch *otherTouch = touches[1];
+            if (otherTouch.uuid == cursorTouch.uuid) {
+                otherTouch = touches[0];
+            }
+            
+            self.gestureAdditionalTouch = otherTouch;
+            
+            if (self.gestureAdditionalTouch.isActive) {
+                CGPoint trajectoryA = [cursorTouch trajectorySign];
+                CGPoint trajectoryB = [otherTouch trajectorySign];
+                
+                
+                if (   !CGPointEqualToPoint(trajectoryA, CGPointZero)
+                    && !CGPointEqualToPoint(trajectoryB, CGPointZero)) {
+                    
+                    if (!CGPointEqualToPoint(trajectoryA, trajectoryB)) {
+                        self.identifiedMultitouchGesture = TUCCursorGesturePinch;
+                    }
+                    //                    else {
+                    //                        self.identifiedMultitouchGesture = TUCCursorGestureTwoFingerDrag;
+                    //                    }
+                }
+                
+            } else {
+                // secondary click
+                [self removeTouch:self.gestureAdditionalTouch now:YES];
+                self.gestureAdditionalTouch = nil;
+                [self performMouseEventForGesture:TUCCursorGestureTapSecondFinger];
+            }
+        }
+        
+        // other finger lifted, gesture ended
+        if (!self.gestureAdditionalTouch.isActive) {
+            [self stopCurrentGesture];
+        }
+        
+        
+        if(self.identifiedMultitouchGesture != _TUCCursorGestureNone) {
+            [self performMouseEventForGesture:self.identifiedMultitouchGesture];
+            return;
+        }
+        
+    }
+    
+    
+    if (self.cursorTouchDidHold) {
+        [self performMouseEventForGesture:TUCCursorGestureHoldAndDrag];
+    } else {
+        [self performMouseEventForGesture:TUCCursorGestureDrag];
+    }
+}
+
+
+- (BOOL)checkForSecondaryClick {
+    //    if (self.identifiedMultitouchGesture != _TUCCursorGestureNone) {
+    //        return NO;
+    //    }
+    
+    NSSet<TUCTouch *> *touchesInProximity = [self touchesInProximityTo:self.cursorTouch.location maxDistance:60 locationID:self.cursorTouch.locationID];
+    if (touchesInProximity.count >= 2 && self.identifiedMultitouchGesture == _TUCCursorGestureNone) {
+        
+        // TUCCursorGestureTwoFingerTap
+        NSPredicate *p1 = [NSPredicate predicateWithFormat:@"phase == %d", NSTouchPhaseEnded];
+        NSPredicate *p2 = [NSPredicate predicateWithFormat:@"phase == %d", NSTouchPhaseCancelled];
+        
+        NSPredicate *p3 = [NSPredicate predicateWithFormat:@"contactID != %d", self.cursorTouch.contactID];
+        
+        NSPredicate *p4 = [NSCompoundPredicate orPredicateWithSubpredicates:@[p1, p2]];
+        NSPredicate *p5 = [NSCompoundPredicate andPredicateWithSubpredicates:@[p3, p4]];
+        
+        NSSet<TUCTouch *> *endedTouches = [touchesInProximity filteredSetUsingPredicate:p5];
+        
+        if (endedTouches.count == 1) {
+            for (TUCTouch* touchToRemove in endedTouches) {
+                [self removeTouch:touchToRemove now:YES];
+            }
+            
+            [self performMouseEventForGesture:TUCCursorGestureTapSecondFinger];
+            return YES;
+        }
+    }
+    return NO;
+}
+
+
+- (void)performMouseEventForGesture:(TUCCursorGesture)gesture {
+    TUCTouch *touch = self.cursorTouch;
+    
+    CGPoint screenLocation = [self convertScreenPointRelativeToAbsolute:touch.location locationID:touch.locationID];
+    CGPoint location2ndFinger = [self convertScreenPointRelativeToAbsolute:self.gestureAdditionalTouch.location locationID:touch.locationID];
+    
+    TUCCursorUtilities *utils = [TUCCursorUtilities sharedInstance];
+    
+    TUCCursorAction action = [self actionForGesture:gesture];
+    
+    CGFloat doubleClickSpan = self.doubleClickTolerance * [[self touchscreenForLocationID:touch.locationID] pixelsPerMM];
+    [[TUCCursorUtilities sharedInstance] setDoubleClickTolerance:doubleClickSpan];
+    
+    switch (action) {
+        case TUCCursorActionNone:
+            break;
+            
+        case TUCCursorActionMove:
+            [utils moveCursorTo:screenLocation];
+            break;
+            
+        case TUCCursorActionMoveClickIfNeeded:
+            [utils moveCursorTo:screenLocation];
+            if ([self isLocationOutsideFrontmostWindow:screenLocation locationID:touch.locationID]) {
+                [utils performClickAt:screenLocation];
+            }
+            
+            break;
+            
+        case TUCCursorActionPointAndClick:
+            [utils moveCursorTo:screenLocation];
+            if (touch.phase == NSTouchPhaseEnded) {
+                [utils performClickAt:screenLocation];
+            }
+            break;
+            
+        case TUCCursorActionDrag:
+            [utils dragCursorTo:screenLocation phase:touch.phase];
+            break;
+            
+        case TUCCursorActionClick:
+            [utils performClickAt:screenLocation];
+            break;
+            
+        case TUCCursorActionSecondaryClick:
+            [utils performSecondaryClickAt: screenLocation];
+            break;
+            
+        case TUCCursorActionScroll: {
+            CGPoint prevLocation = [self convertScreenPointRelativeToAbsolute:touch.previousLocation locationID:touch.locationID];
+            CGPoint translation = CGPointMake(screenLocation.x - prevLocation.x,
+                                              screenLocation.y - prevLocation.y);
+            [utils scroll:translation phase:touch.phase];
+            
+            break; }
+            
+        case TUCCursorActionMissionControl:
+            [utils postKeystroke:126 flags:kCGEventFlagMaskControl]; // ctrl + up arrow
+            break;
+            
+        case TUCCursorActionAppExpose:
+            [utils postKeystroke:125 flags:kCGEventFlagMaskControl]; // ctrl + down arrow
+            break;
+            
+        case TUCCursorActionSpaceLeft:
+            [utils postKeystroke:123 flags:kCGEventFlagMaskControl]; // ctrl + left arrow
+            break;
+            
+        case TUCCursorActionSpaceRight:
+            [utils postKeystroke:124 flags:kCGEventFlagMaskControl]; // ctrl + right arrow
+            break;
+            
+        case TUCCursorActionAppSwitch:
+            [utils postKeystroke:48 flags:kCGEventFlagMaskCommand]; // cmd + tab
+            break;
+            
+        case TUCCursorActionQuitApp:
+            [utils postKeystroke:12 flags:kCGEventFlagMaskCommand]; // cmd + q
+            break;
+            
+        case TUCCursorActionMagnify:
+            [utils magnifyLocationA:screenLocation
+                          locationB:location2ndFinger
+                         relativeP1:self.cursorTouch.location relP2:self.gestureAdditionalTouch.location];
+            
+            if (touch.phase == NSTouchPhaseEnded || self.gestureAdditionalTouch.phase == NSTouchPhaseEnded) {
+                [utils stopMagnifying];
+            }
+            break;
+    }
+}
+
+
+- (TUCCursorAction)actionForGesture:(TUCCursorGesture)gesture {
+    
+    if (self.delegate != nil) {
+        return [self.delegate actionForGesture:gesture];
+    }
+    
+    switch(gesture) {
+        case TUCCursorGestureTouchDown:         return TUCCursorActionMoveClickIfNeeded;
+        case TUCCursorGestureTap:               return TUCCursorActionClick;
+        case TUCCursorGestureLongPress:         return TUCCursorActionClick;
+        case TUCCursorGestureDrag:              return TUCCursorActionScroll;
+        case TUCCursorGestureHoldAndDrag:       return TUCCursorActionDrag;
+        case TUCCursorGestureTapSecondFinger:   return TUCCursorActionSecondaryClick;
+        case TUCCursorGestureTwoFingerDrag:     return TUCCursorActionDrag;
+            
+        case TUCCursorGesturePinch:             return TUCCursorActionMagnify;
+            
+        case TUCCursorGestureThreeFingerSwipeUp:    return TUCCursorActionMissionControl;
+        case TUCCursorGestureThreeFingerSwipeDown:  return TUCCursorActionAppExpose;
+        // content follows the finger, like iPadOS: swipe left moves to the space on the right
+        case TUCCursorGestureThreeFingerSwipeLeft:  return TUCCursorActionSpaceRight;
+        case TUCCursorGestureThreeFingerSwipeRight: return TUCCursorActionSpaceLeft;
+        case TUCCursorGestureThreeFingerTap:        return TUCCursorActionAppSwitch;
+        case TUCCursorGestureFourFingerPinchIn:     return TUCCursorActionQuitApp;
+            
+        case _TUCCursorGestureNone:             return TUCCursorActionNone;
+    }
+}
+
+
+#pragma mark - Touch Set
+
+/**
+ The `touchSet` can contain touches whose phase is ended or cancelled. activeTouches. filteres those out
+ */
+- (NSSet<TUCTouch *> *)activeTouches {
+    NSPredicate *p1 = [NSPredicate predicateWithFormat:@"phase != %d", NSTouchPhaseEnded];
+    NSPredicate *p2 = [NSPredicate predicateWithFormat:@"phase != %d", NSTouchPhaseCancelled];
+    
+    NSPredicate *predicate = [NSCompoundPredicate andPredicateWithSubpredicates:@[p1, p2]];
+    
+    return [self.touchSet filteredSetUsingPredicate:predicate];
+}
+
+
+
+- (CGPoint)centroidOfTouches:(NSArray<TUCTouch *> *)touches {
+    CGFloat x = 0, y = 0;
+    for (TUCTouch *t in touches) { x += t.location.x; y += t.location.y; }
+    NSUInteger n = MAX(touches.count, (NSUInteger)1);
+    return CGPointMake(x / n, y / n);
+}
+
+
+// mean distance of the touches from their centroid, in relative screen units
+- (CGFloat)spreadOfTouches:(NSArray<TUCTouch *> *)touches around:(CGPoint)centroid {
+    if (touches.count == 0) return 0;
+    CGFloat sum = 0;
+    for (TUCTouch *t in touches) {
+        sum += sqrt(pow(t.location.x - centroid.x, 2) + pow(t.location.y - centroid.y, 2));
+    }
+    return sum / touches.count;
+}
+
+
+- (CGFloat)distanceBetweenPoint:(CGPoint)p1 and:(CGPoint)p2 {
+    CGFloat dx = p1.x - p2.x;
+    CGFloat dy = p1.y - p2.y;
+    
+    return sqrt( pow(dx, 2) + pow(dy, 2) );
+}
+
+
+/**
+ maxDistance in mm
+ */
+- (NSSet<TUCTouch *> *)touchesInProximityTo:(CGPoint)point maxDistance:(CGFloat)mmDistance locationID:(uint32_t)locationID {
+    
+    TUCScreen *screen = [self touchscreenForLocationID:locationID];
+    CGFloat screenDistance = mmDistance * [screen pixelsPerMM];
+    CGPoint distance = CGPointMake(screenDistance / screen.frame.size.width,
+                                   screenDistance / screen.frame.size.height);
+    
+    NSPredicate * predicate = [NSPredicate predicateWithBlock: ^BOOL(TUCTouch *t, NSDictionary *bind) {
+        if (t.locationID != locationID) return NO;
+
+        CGFloat dx = [t location].x - point.x;
+        CGFloat dy = [t location].y - point.y;
+
+        return sqrt( pow(dx, 2) + pow(dy, 2) ) < distance.x;
+    }];
+    
+    return [self.touchSet filteredSetUsingPredicate:predicate];
+}
+
+
+/**
+ Removes a touch from the touch set. As a previous touch might be important for gesture evaluation, it is removed after half a second
+ */
+- (void)removeTouch:(TUCTouch *)touch now:(BOOL)instantDeletion{
+    //    if (touch.uuid == self.touchUsedForCursor.uuid) {
+    //        [self processTouchesForCursorInput];
+    //        self.touchUsedForCursor = nil;
+    //    }
+    
+    if (instantDeletion) {
+        [[self touchSet] removeObject:touch];
+        [[self delegate] touchesDidChange];
+        return;
+    }
+    
+    __weak id weakSelf = self;
+    NSUUID *uuid = touch.uuid;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 2), dispatch_get_main_queue(), ^{
+        for(TUCTouch *touch in [weakSelf touchSet]) {
+            if (touch.uuid == uuid && [[weakSelf touchSet] containsObject:touch]) {
+                [[weakSelf touchSet] removeObject:touch];
+                [[weakSelf delegate] touchesDidChange];
+                return;
+            }
+        }
+    });
+}
+
+
+/**
+ Checks the touch set if a touch exists
+ */
+- (TUCTouch *)findTouchWithID:(NSInteger)contactID locationID:(uint32_t)locationID includingPastTouches:(BOOL)includePastTouches {
+    NSSet *set = includePastTouches ? self.touchSet : [self activeTouches];
+    
+    NSPredicate *predicate = [NSPredicate predicateWithFormat:@"contactID == %d AND locationID == %u", contactID, locationID];
+    TUCTouch *touch = [[set filteredSetUsingPredicate:predicate] anyObject];
+    return touch;
+}
+
+/**
+ Returns the existing touch object or a new one if this ID does not exist in the set yet.
+ */
+- (TUCTouch *)obtainTouchWithID:(NSInteger)contactID locationID:(uint32_t)locationID isNew:(BOOL*)isNew {
+    TUCTouch *touch = [self findTouchWithID:contactID locationID:locationID includingPastTouches:NO];
+    *isNew = NO;
+    if(!touch) {
+        touch = [[TUCTouch alloc] initWithContactID:contactID locationID:locationID];
+        [self.touchSet addObject:touch];
+        *isNew = YES;
+    }
+    return touch;
+}
+
+
+
+
+
+#pragma mark - Screen Characteristics
+
+/**
+ the relative hardware points are always in the direction the digitizer is built in.
+ If the display is rotated, we need to rotate these points
+ */
+- (CGPoint)convertDigitizerPointToRelativeScreenPoint:(CGPoint)devicePoint locationID:(uint32_t)locationID {
+    TUCScreen *screen = [self touchscreenForLocationID:locationID];
+
+    CGFloat rotation = screen.rotation;
+
+    CGFloat extra = [[self delegate] digitizerRotationForLocationID:locationID];
+
+    rotation += extra;
+    rotation = fmod(rotation, 360);
+    if (rotation < 0) {
+        rotation += 360;
+    }
+
+    // Rotate the glass-relative point into the screen's content orientation.
+    CGPoint rotated;
+    if (rotation == 180) {
+        rotated = CGPointMake(1 - devicePoint.x, 1 - devicePoint.y);
+    } else if (rotation == 90) {
+        rotated = CGPointMake(1 - devicePoint.y, devicePoint.x);
+    } else if (rotation == 270) {
+        rotated = CGPointMake(devicePoint.y, 1 - devicePoint.x);
+    } else {
+        rotated = devicePoint;
+    }
+
+    // Then account for any letterboxing when the content doesn't fill the panel (mirroring
+    // a differently-shaped display). A no-op when the aspect ratios already match.
+    return [screen convertGlassPointToContentPoint:rotated];
+}
+
+
+
+- (CGPoint)convertScreenPointRelativeToAbsolute:(CGPoint)relativePoint locationID:(uint32_t)locationID {
+    return [[self touchscreenForLocationID:locationID] convertPointRelativeToAbsolute:relativePoint];
+}
+
+
+
+- (TUCScreen *)touchscreenForLocationID:(uint32_t)locationID {
+    if (self.delegate != nil) {
+        return [self.delegate touchscreenForLocationID:locationID];
+    }
+    
+    return [[TUCScreen allScreens] firstObject];
+}
+
+
+
+- (BOOL)isPointInMenuBar:(CGPoint)point locationID:(uint32_t)locationID {
+    CGFloat menuBarHeight = [[[NSApplication sharedApplication] mainMenu] menuBarHeight];
+    
+    CGRect screenFrame = [self touchscreenForLocationID:locationID].frame;
+    CGRect menuBarFrame = CGRectMake(screenFrame.origin.x,
+                                     screenFrame.origin.y * -1,
+                                     screenFrame.size.width,
+                                     menuBarHeight);
+    
+    if (CGRectContainsPoint(menuBarFrame, point)) {
+        return YES;
+    }
+    return NO;
+}
+
+
+- (BOOL)isSystemChromeOwner:(pid_t)pid name:(NSString *)ownerName {
+    static NSSet<NSString *> *chromeBundleIDs;
+    static NSSet<NSString *> *chromeOwnerNames;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        chromeBundleIDs = [NSSet setWithArray:@[
+            @"com.apple.dock",
+            @"com.apple.controlcenter",
+            @"com.apple.notificationcenterui",
+        ]];
+        // The Window Server has no NSRunningApplication, so match it by owner name.
+        chromeOwnerNames = [NSSet setWithArray:@[ @"Window Server", @"WindowServer" ]];
+    });
+
+    if (ownerName && [chromeOwnerNames containsObject:ownerName]) {
+        return YES;
+    }
+
+    NSString *bundleID = [NSRunningApplication runningApplicationWithProcessIdentifier:pid].bundleIdentifier;
+    return bundleID != nil && [chromeBundleIDs containsObject:bundleID];
+}
+
+
+- (BOOL)isLocationOutsideFrontmostWindow:(CGPoint)point locationID:(uint32_t)locationID {
+
+    if ([self isPointInMenuBar:point locationID:locationID]) {
+        return NO;
+    }
+
+    pid_t frontmostPID = [[[NSWorkspace sharedWorkspace] frontmostApplication] processIdentifier];
+
+    CFArrayRef array = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly|kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+
+    // The window list is ordered front-to-back by window *level* (not grouped by app), so
+    // high-level overlays — including our own screenSaver-level panels — come before the
+    // active app's normal windows. `behindFrontmostWindow` flips once we pass the active
+    // app's topmost window: windows seen before it are stacked above it, windows after are
+    // behind it.
+    BOOL behindFrontmostWindow = NO;
+    BOOL res = NO;
+
+    for (CFIndex i=0; i<CFArrayGetCount(array); i++) {
+        CFDictionaryRef dic = CFArrayGetValueAtIndex(array, i);
+
+        CFNumberRef numPid = CFDictionaryGetValue(dic, kCGWindowOwnerPID);
+        pid_t currPID;
+        CFNumberGetValue(numPid, kCFNumberIntType,  &currPID);
+        BOOL isFrontmostApp = currPID == frontmostPID;
+
+        CFDictionaryRef bounds = CFDictionaryGetValue(dic, kCGWindowBounds);
+        CGRect nextFrame;
+        CGRectMakeWithDictionaryRepresentation(bounds, &nextFrame);
+        BOOL isInside = CGRectContainsPoint(nextFrame, point);
+
+        if (isFrontmostApp && !behindFrontmostWindow) {
+            behindFrontmostWindow = YES;
+        }
+
+        if (!isInside) continue;
+
+        NSString *ownerName = (__bridge NSString *)CFDictionaryGetValue(dic, kCGWindowOwnerName);
+        if ([self isSystemChromeOwner:currPID name:ownerName]) {
+            continue;
+        }
+
+        // First real window under the point = the one the finger actually hits.
+        if (isFrontmostApp) {
+            res = NO;   // already the active window — the tap actuates it directly
+        } else if (!behindFrontmostWindow) {
+            res = NO;   // stacked above the active app (an overlay or our own panel) — takes the tap directly
+        } else {
+            // A background window of another app — normally inject a click to raise it.
+            // Exception: the title bar. A background title bar accepts clicks directly, so
+            // our injected raise-click plus the tap's own click would register as a
+            // title-bar double-click (→ zoom/fullscreen). A single tap already raises the
+            // window, so skip the extra click within the title-bar strip.
+            //
+            // CGWindowList can't tell us the actual title-bar/toolbar height, so this is a
+            // heuristic constant. Erring high (toolbars on Tahoe are tall) costs at most a
+            // missed raise-click near the top of a background window; erring low brings the
+            // destructive double-click-zoom back.
+            CGFloat titleBarHeight = 44;
+            BOOL inTitleBar = (point.y - nextFrame.origin.y) <= titleBarHeight;
+            res = inTitleBar ? NO : YES;
+        }
+        break;
+    }
+
+    CFRelease(array);
+    return res;
+}
+
+
+
+
+#pragma mark -
+
+- (instancetype)init {
+    if(self = [super init]) {
+        self.touchSet = [NSMutableSet new];
+        self.postMouseEvents = YES;
+        
+        self.cursorTouchQualifiedForTap = NO;
+        self.cursorTouchStationarySinceDate = nil;
+        
+        self.frameIDsByLocationID = [NSMutableDictionary new];
+        self.identifiedMultitouchGesture = _TUCCursorGestureNone;
+        
+        self.doubleClickTolerance = 5;
+        self.holdDuration = 0.08;
+        self.errorResistance = 0;
+        
+        self.ignoreOriginTouches = NO;
+    }
+    return self;
+}
+
+
+- (NSString *)debugDescription {
+    NSMutableString *str = [[NSString stringWithFormat:@"Touch Set contains %ld touches:{\n", [self.touchSet count]] mutableCopy];
+    
+    for (TUCTouch *touch in [[self.touchSet allObjects] sortedArrayUsingSelector:@selector(compareWithAnotherTouch:)] ) {
+        [str appendString: [NSString stringWithFormat:@"  %@", [touch debugDescription]] ];
+        if (touch.contactID == self.cursorTouch.contactID) {
+            [str appendString: @" <<<CURSOR>>>\n" ];
+        } else {
+            [str appendString: @"\n" ];
+        }
+    }
+    
+    [str appendString:@"}"];
+    return str;
+}
+
+- (void)triggerSystemAccessibilityAccessAlert {
+    CGPoint loc = [[TUCCursorUtilities sharedInstance] currentCursorLocation];
+    [[TUCCursorUtilities sharedInstance] moveCursorTo:loc];
+}
+
+
+
+#pragma mark - Bridge calls of C Header to Objective-C
+
+void TouchInputManagerUpdateTouchPosition(void *self, uint32_t locationID, CFIndex contactID, CGFloat x, CGFloat y, Boolean onSurface, Boolean isValid) {
+    CGPoint point = CGPointMake(x, y);
+    [(__bridge id)self updateTouch:(NSInteger)contactID locationID:locationID withLocation:point onSurface:onSurface tooLargeForFinger:isValid];
+}
+
+void TouchInputManagerUpdateTouchSize(void *self, uint32_t locationID, CFIndex contactID, CGFloat width, CGFloat height, CGFloat azimuth) {
+    CGSize size = CGSizeMake(width, height);
+    [(__bridge id)self updateTouch:(NSInteger)contactID locationID:locationID withSize:size azimuth:azimuth];
+}
+
+void TouchInputManagerDidProcessReport(void *self, uint32_t locationID) {
+    [(__bridge id)self didProcessReportForLocationID:locationID];
+}
+
+void TouchInputManagerDidConnectTouchscreen(void *self, uint32_t locationID) {
+    [(__bridge id)self didConnectTouchscreenWithLocationID:locationID];
+}
+
+void TouchInputManagerDidDisconnectTouchscreen(void *self, uint32_t locationID) {
+    [(__bridge id)self didDisconnectTouchscreenWithLocationID:locationID];
+}
+
+
+@end
