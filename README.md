@@ -63,14 +63,14 @@ no Xcode required.
 - macOS 13 (Ventura) or later
 - A USB touchscreen that reports standard HID digitizer data (most do — if it
   works on Windows without a driver, it will work here)
-- **Xcode** (from the Mac App Store) to build. Command Line Tools alone are not
-  enough — the driver is an Xcode project. Install Xcode, launch it once, then
-  run the installer.
+- **Xcode** (from the Mac App Store) — only if you build from source rather than
+  using the DMG. The driver is an Xcode project; Command Line Tools alone can't
+  build it.
 
-> **Why do I have to build it myself?** TouchDeck ships as source, signed
-> locally on your machine. It is **not** notarized by Apple (that needs a paid
-> Apple Developer account). Building locally is the friction-free way to get an
-> app macOS will trust. See [Distribution & signing](#distribution--signing).
+> **DMG vs. source?** The DMG is the fastest path but isn't notarized by Apple
+> (that needs a paid Apple Developer account), so macOS makes you click "Open
+> Anyway" once per app. Building from source needs Xcode but is trusted
+> automatically. Same apps either way. See [Distribution & signing](#distribution--signing).
 
 ---
 
@@ -166,18 +166,18 @@ These fixes and features are candidates to contribute back upstream.
 
 ## Distribution & signing
 
-TouchDeck is **built and signed locally** on each machine with an ad-hoc
-signature. That means:
+TouchDeck is distributed two ways, both **ad-hoc signed** (no Apple Developer
+account, no cost):
 
-- No Apple Developer account required, no cost.
-- The app macOS runs is one it saw compiled on your Mac, so Gatekeeper trusts
-  it and the Accessibility grant is stable.
-- The trade-off: there's no downloadable pre-notarized `.app`. Everyone builds
-  from source with the one-line installer.
+- **DMG release** — prebuilt, drag-to-Applications, no Xcode. Because it isn't
+  notarized, macOS Gatekeeper makes you approve each app once in System Settings
+  › Privacy & Security ("Open Anyway"). This is the normal flow for unsigned
+  open-source Mac apps.
+- **Build from source** — compiled on your own Mac, so Gatekeeper trusts it with
+  no "Open Anyway" step. Needs Xcode.
 
-If this project later gets an Apple Developer ID, a notarized `.dmg` release
-would make installation a drag-and-drop with no Xcode needed. Contributions
-welcome.
+If this project later gets an Apple Developer ID, the DMG could be **notarized**,
+removing the "Open Anyway" step entirely. Contributions welcome.
 
 ---
 
