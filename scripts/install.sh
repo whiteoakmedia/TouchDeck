@@ -60,6 +60,7 @@ xcodebuild -project "$ROOT/TouchUp/Touch Up.xcodeproj" \
     -scheme "Touch Up" -configuration Release \
     -derivedDataPath "$BUILD/dd" \
     CODE_SIGN_IDENTITY="-" CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM="" \
+    ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO MACOSX_DEPLOYMENT_TARGET=12.0 \
     build >"$BUILD/touchup.log" 2>&1 \
   || { tail -20 "$BUILD/touchup.log"; die "Touch Up build failed (see log above)."; }
 
@@ -86,15 +87,21 @@ cat > "$TK_APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleExecutable</key><string>TouchKeys</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>LSUIElement</key><true/>
 </dict>
 </plist>
 PLIST
-xcrun swiftc -O -o "$TK_APP/Contents/MacOS/TouchKeys" \
-    "$ROOT/TouchKeys/TouchKeys.swift" \
-    -framework AppKit -framework ApplicationServices \
-  || die "TouchKeys build failed."
+for arch in arm64 x86_64; do
+    xcrun swiftc -O -target "$arch-apple-macos12.0" \
+        -o "$TK_APP/Contents/MacOS/TouchKeys.$arch" \
+        "$ROOT/TouchKeys/TouchKeys.swift" \
+        -framework AppKit -framework ApplicationServices \
+      || die "TouchKeys build failed ($arch)."
+done
+lipo -create -output "$TK_APP/Contents/MacOS/TouchKeys" \
+    "$TK_APP/Contents/MacOS/TouchKeys.arm64" "$TK_APP/Contents/MacOS/TouchKeys.x86_64"
+rm -f "$TK_APP/Contents/MacOS/TouchKeys.arm64" "$TK_APP/Contents/MacOS/TouchKeys.x86_64"
 codesign --force --sign - --timestamp=none "$TK_APP" >/dev/null 2>&1 || true
 
 # ---- install -----------------------------------------------------------------

@@ -60,7 +60,7 @@ no Xcode required.
 
 ## Requirements
 
-- macOS 13 (Ventura) or later
+- macOS 12 (Monterey) or later — Intel and Apple Silicon (universal build)
 - A USB touchscreen that reports standard HID digitizer data (most do — if it
   works on Windows without a driver, it will work here)
 - **Xcode** (from the Mac App Store) — only if you build from source rather than
