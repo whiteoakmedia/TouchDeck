@@ -1,0 +1,62 @@
+{
+  "$comment": "Read by whiteoakmedia.io/tools at render time (cached ~10 min). Edit this when features, requirements or install steps change; the site needs no deploy. Any key may be omitted to keep the site's default. Download buttons come from the latest GitHub Release's assets, not from here; `installers` is only the fallback when GitHub's API is unavailable, and must use stable (unversioned) filenames.",
+  "tagline": "Turn any USB touchscreen into a first-class Mac touch console.",
+  "description": "Two small apps that make a plain USB touchscreen feel native on a Mac. Touch Up is a user-space driver that turns raw touch data into reliable taps, drags, scrolls and multi-finger gestures. TouchKeys is an on-screen keyboard that appears whenever you tap into a text field. Built for a production Mac running ProPresenter from a touch panel, but it works for kiosks, lecterns and signage too.",
+  "origin": "An enhanced fork of shueber/Touch-Up, tuned against a real panel in a real booth.",
+  "platform": "macOS 12 Monterey or later, Intel or Apple Silicon (universal build)",
+  "stack": "Swift + Objective-C, built with Xcode",
+  "requirements": [
+    "A USB touchscreen that reports standard HID digitizer data. If it works on Windows without a driver, it works here.",
+    "Xcode from the Mac App Store only if you build from source. The .dmg needs nothing extra.",
+    "One-time Accessibility permission for both apps in System Settings."
+  ],
+  "featureGroups": [
+    {
+      "title": "Touch Up driver",
+      "items": [
+        "Reliable tap-to-click with a cumulative slop zone, so real fingertips register",
+        "Hold-and-drag, one-finger scroll, pinch to zoom, two-finger right-click",
+        "Three-finger swipes for Mission Control, App Exposé and Spaces; three-finger tap for previous app; four-finger pinch to quit",
+        "Per-display mapping so touches land on the right monitor in a multi-screen booth"
+      ]
+    },
+    {
+      "title": "TouchKeys keyboard",
+      "items": [
+        "Fades in at the bottom of the touch display when a text field has focus, fades out when you tap elsewhere",
+        "Pin mode from the menu bar, one-shot shift, numbers and symbols layer",
+        "Handles Chromium and Electron apps (Chrome, VS Code, Slack) specially so their fields are detected"
+      ]
+    }
+  ],
+  "caveat": "The apps are ad-hoc signed, not notarized by Apple, so macOS asks you to approve each one on first launch. Building from source skips that step, since a locally compiled build is trusted automatically. Spotlight does not work with the keyboard because Spotlight closes on any outside tap.",
+  "installers": {
+    "mac": "TouchDeck.dmg"
+  },
+  "installSteps": {
+    "mac": [
+      "Download TouchDeck.dmg, open it, and drag both apps onto the Applications folder.",
+      "First launch: double-click each app, close the warning, then System Settings › Privacy & Security › Open Anyway, once per app. (Right-click › Open no longer works on macOS 15 Sequoia and later.) The apps are ad-hoc signed, not notarized.",
+      "Grant Accessibility to both apps, then open Touch Up and map your touchscreen to its display."
+    ]
+  },
+  "buildFromSource": [
+    {
+      "label": "Clone the repo",
+      "command": "git clone https://github.com/whiteoakmedia/TouchDeck.git"
+    },
+    {
+      "label": "Build, sign, install to /Applications, set launch-at-login",
+      "command": "cd TouchDeck && ./scripts/install.sh"
+    },
+    {
+      "label": "Remove everything later",
+      "command": "./scripts/uninstall.sh"
+    }
+  ],
+  "guide": {
+    "label": "Illustrated setup guide",
+    "path": "blob/main/docs/SETUP.md"
+  },
+  "license": "MIT"
+}
